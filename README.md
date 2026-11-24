@@ -838,6 +838,55 @@ files.
 
 Many Gradle issues can be fixed by stopping the Gradle daemon by running `./gradlew --stop`.
 
+## Fork branch `wasm/aws-chunked-browser-bytes`
+
+This branch fixes the browser variant of the aws-chunked request encoder in `@smithy/core`
+(`packages/core/src/submodules/serde/util-stream/getAwsChunkedEncodingStream.browser.ts`). The encoder is used when a
+client built with the browser runtime config (browsers, Wasm components built with ComponentizeJS/StarlingMonkey,
+other WinterCG runtimes) sends a `ReadableStream` request body with a flexible checksum, for example S3 `PutObject` with
+the default `requestChecksumCalculation: "WHEN_SUPPORTED"`.
+
+### Problems fixed
+
+1. **The encoder enqueued strings.** Chunk-size lines, `\r\n`, the trailer and `` `${value}` `` of each data chunk were
+   enqueued as JavaScript strings. `fetch` requires a request `ReadableStream` to produce `Uint8Array` values, so the
+   request fails with `TypeError: ReadableStream used as a Request or Response body must produce Uint8Array values`.
+   Stringifying a `Uint8Array` data chunk also corrupted binary payloads (`"97,98,99"` instead of `abc`).
+2. **The trailing checksum covered zero bytes.** The checksum was computed with `streamHasher(checksumAlgorithmFn,
+   readableStream)`. In the browser `streamHasher` is the blob hasher, which reads `blob.size` and `blob.slice()`; for a
+   `ReadableStream` these do not exist, so it hashed nothing and the trailer always carried the checksum of empty data
+   (for CRC32: `AAAAAA==`). S3 rejects such uploads with `BadDigest`. Fixing problem 1 alone exposes this problem.
+
+### Approach
+
+- Framing (`<hex size>\r\n`, `\r\n`, `0\r\n`, `<header>:<checksum>\r\n`, final `\r\n`) is encoded with `TextEncoder`;
+  every value passed to `controller.enqueue()` is a `Uint8Array`.
+- Data chunks are converted with a small `toBytes()` helper: `Uint8Array` is passed through unchanged, other
+  `ArrayBufferView`s and `ArrayBuffer`s are wrapped without copying, strings are UTF-8 encoded, anything else is a
+  `TypeError`. The chunk size is the encoded byte length (correct for multi-byte UTF-8 strings).
+- Empty chunks are skipped, because a zero-length chunk terminates an aws-chunked body.
+- The checksum is computed incrementally over the same bytes that are sent (`new checksumAlgorithmFn()`,
+  `update()` per chunk, `digest()` at the end) and base64-encoded into the trailer.
+- `cancel()` on the encoded stream is forwarded to the source reader; source errors are propagated.
+
+### Tests
+
+`packages/core/src/submodules/serde/util-stream/getAwsChunkedEncodingStream.browser.spec.ts` (20 tests, run with the
+browser vitest config) asserts that every emitted chunk is a `Uint8Array` and that the decoded wire bytes match the
+aws-chunked format, including the trailer value (checked against an independent CRC32), for string, `Uint8Array`,
+`ArrayBuffer`, `DataView`, multi-byte UTF-8, empty, single and many-chunk inputs, plus error and cancel propagation.
+Against the original implementation 19 of the 20 tests fail.
+
+```bash
+yarn g:vitest run -c vitest.config.browser.mts \
+  packages/core/src/submodules/serde/util-stream/getAwsChunkedEncodingStream.browser.spec.ts
+```
+
+The change is covered by the changeset `.changeset/wasm-aws-chunked-browser-bytes.md` (`@smithy/core` patch). An
+end-to-end proof (S3 `PutObject` with a `ReadableStream` body and default checksums inside a wasmtime-hosted
+ComponentizeJS component, against a strict stub S3 and real S3) lives in the `aws-sdk-js-v3-test-apps` repository,
+branch `prototype/aws-chunked-browser-bytes`, app `apps/aws-chunked-stream-fix`.
+
 ## License
 
 This library is licensed under the Apache 2.0 License.
